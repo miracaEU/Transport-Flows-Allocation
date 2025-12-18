@@ -1,0 +1,57 @@
+# Data files
+*.parquet
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.csv
+*.geojson
+
+# Large raster files
+*.tif
+*.tiff
+
+# Output files
+*.png
+*.jpg
+*.pdf
+*.html
+
+# Processed data directories
+**/processed_data/
+**/incoming_data/
+**/output/
+**/results/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
