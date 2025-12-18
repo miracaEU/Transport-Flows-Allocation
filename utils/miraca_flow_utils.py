@@ -407,7 +407,6 @@ def plot_edges_by_flow_thickness(
 
     # Compute linewidths
     df['lw'] = vals.apply(map_to_lw)
-    print(df.head())
 
     # Plot by corridor (keeping U under), using LineCollection for variable linewidths
     for k in keys_for_plot:
