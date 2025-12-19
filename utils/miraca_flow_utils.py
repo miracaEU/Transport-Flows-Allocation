@@ -12,7 +12,7 @@ import uuid
 from matplotlib.collections import LineCollection
 import matplotlib.lines as mlines
 
-def plot_bubble_map(ports_gdf, flow_column, corridor_col, country_geometry, country_name, 
+def plot_bubble_map(ax, ports_gdf, flow_column, corridor_col, country_geometry, country_name, 
                     flow_type, mode, outpath, scale_factor=100, flow_values = [100, 10000, 100000, 1000000], transport_mode='maritime'):
     """
     Create a bubble map visualization of port flows.
@@ -44,7 +44,10 @@ def plot_bubble_map(ports_gdf, flow_column, corridor_col, country_geometry, coun
         print(f"No {transport_mode.lower()} {mode.lower()} {flow_type.lower()} flows to visualize")
         return
     
-    fig, ax = plt.subplots(figsize=(14, 10))
+    created_fig = False
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(14, 10))
+        created_fig = True
     
     # Plot country boundary
     country_geometry.plot(ax=ax, facecolor='lightgray', edgecolor='black', linewidth=1, alpha=0.5)
@@ -182,9 +185,10 @@ def plot_bubble_map(ports_gdf, flow_column, corridor_col, country_geometry, coun
     ax.set_ylabel('Latitude')
     
     # Save or show, always use bbox_inches='tight' to avoid legend clipping
-    filename = f'{transport_mode.lower()}_{mode.lower()}_{flow_type.lower()}_bubbles_{country_name.replace(" ", "_")}.png'
-    plt.savefig(outpath / filename, dpi=300, bbox_inches='tight')
-    plt.show()
+    filename = f'{transport_mode.lower()}_bubbles_{country_name.replace(" ", "_")}.png'
+    if created_fig:
+        plt.savefig(outpath / filename, dpi=300, bbox_inches='tight')
+        plt.show()
 
 
 
@@ -563,6 +567,35 @@ def compute_edge_capacity(edges_view: pd.DataFrame, tt_col='travel_time', train_
         return smoothed.astype(float)
     else:
         return raw_capacity
+
+
+def compute_edge_capacity_cars(edges_view: pd.DataFrame, tt_col='travel_time', share_cars=1, share_trucks=0, share_buses=0) -> np.ndarray:
+    days_per_year = 300
+    hours_per_day = 24
+    # Set base capacity per tag_highway
+    highway_capacities = {
+        'motorway': 3000,
+        'trunk': 2500,
+        'primary': 2000,
+        'secondary': 1500
+    }
+    if 'tag_highway' in edges_view.columns:
+        tag_hw = edges_view['tag_highway'].astype(str).str.lower()
+        base_capacity = tag_hw.map(highway_capacities).fillna(1800).astype(float)
+    else:
+        base_capacity = np.full(len(edges_view), 500.0, dtype=float)
+
+    # Joint capacity using shares and PCU equivalents
+    # PCU factors
+    pcu_cars = 1.0
+    pcu_trucks = 3.0
+    pcu_buses = 3.0
+    avg_pcu = share_cars * pcu_cars + share_trucks * pcu_trucks + share_buses * pcu_buses
+    # Vehicles per hour (joint capacity)
+    vehicles_per_hour = base_capacity / avg_pcu
+    # Total vehicles per year
+    raw_capacity = vehicles_per_hour * hours_per_day * days_per_year
+    return raw_capacity.astype(float)
     
 
 def ensure_series(df: pd.DataFrame, col: str) -> pd.Series:
@@ -1087,3 +1120,49 @@ def od_flow_allocation_capacity_constrained(flow_ods,
 
     progress_df = pd.DataFrame(progress_records) if track_progress else pd.DataFrame()
     return capacity_ods, unassigned_paths, network_dataframe, progress_df
+
+def od_road_creation(od_cars, od_buses, od_trucks, pcu_cars, pcu_buses, pcu_trucks):
+
+    # Prepare OD dataframes with PCU-weighted flows
+    od_cars_pcu = od_cars[['from_node', 'to_node', 'cars_vehicles']].copy()
+    od_cars_pcu['pcu_flow'] = od_cars_pcu['cars_vehicles'] * pcu_cars
+    od_cars_pcu['pcu_flow_cars'] = od_cars_pcu['pcu_flow']
+    od_cars_pcu['pcu_flow_trucks'] = 0.0
+    od_cars_pcu['pcu_flow_buses'] = 0.0
+
+    od_trucks_pcu = od_trucks[['from_node', 'to_node', 'trucks_per_year']].copy()
+    od_trucks_pcu['pcu_flow'] = od_trucks_pcu['trucks_per_year'] * pcu_trucks
+    od_trucks_pcu['pcu_flow_cars'] = 0.0
+    od_trucks_pcu['pcu_flow_trucks'] = od_trucks_pcu['pcu_flow']
+    od_trucks_pcu['pcu_flow_buses'] = 0.0
+
+    od_buses_pcu = od_buses[['from_node', 'to_node', 'buses_vehicles']].copy()
+    od_buses_pcu['pcu_flow'] = od_buses_pcu['buses_vehicles'] * pcu_buses
+    od_buses_pcu['pcu_flow_cars'] = 0.0
+    od_buses_pcu['pcu_flow_trucks'] = 0.0
+    od_buses_pcu['pcu_flow_buses'] = od_buses_pcu['pcu_flow']
+
+    # Merge all OD flows into a single DataFrame
+    od_all_pcu = pd.concat([
+        od_cars_pcu[['from_node', 'to_node', 'pcu_flow', 'pcu_flow_cars', 'pcu_flow_trucks', 'pcu_flow_buses']],
+        od_trucks_pcu[['from_node', 'to_node', 'pcu_flow', 'pcu_flow_cars', 'pcu_flow_trucks', 'pcu_flow_buses']],
+        od_buses_pcu[['from_node', 'to_node', 'pcu_flow', 'pcu_flow_cars', 'pcu_flow_trucks', 'pcu_flow_buses']]
+    ], axis=0, ignore_index=True)
+
+    # Aggregate by OD pair
+    vehicles_od_pcu = od_all_pcu.groupby(['from_node', 'to_node'], as_index=False).agg({
+        'pcu_flow': 'sum',
+        'pcu_flow_cars': 'sum',
+        'pcu_flow_trucks': 'sum',
+        'pcu_flow_buses': 'sum'
+    })
+
+    # Calculate shares based on PCU flows
+    vehicles_od_pcu['share_cars'] = vehicles_od_pcu['pcu_flow_cars'] / vehicles_od_pcu['pcu_flow']
+    vehicles_od_pcu['share_trucks'] = vehicles_od_pcu['pcu_flow_trucks'] / vehicles_od_pcu['pcu_flow']
+    vehicles_od_pcu['share_buses'] = vehicles_od_pcu['pcu_flow_buses'] / vehicles_od_pcu['pcu_flow']
+
+    # Keep only pcu_flow and shares
+    vehicles_od_pcu = vehicles_od_pcu[['from_node', 'to_node', 'pcu_flow', 'share_cars', 'share_trucks', 'share_buses']]
+
+    return vehicles_od_pcu
