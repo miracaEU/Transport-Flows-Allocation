@@ -1166,3 +1166,571 @@ def od_road_creation(od_cars, od_buses, od_trucks, pcu_cars, pcu_buses, pcu_truc
     vehicles_od_pcu = vehicles_od_pcu[['from_node', 'to_node', 'pcu_flow', 'share_cars', 'share_trucks', 'share_buses']]
 
     return vehicles_od_pcu
+
+
+# =============================================================================
+# Shared Notebook Helper Functions
+# =============================================================================
+
+def convert_crs(gdf, crs:int=4326):
+    """
+    Ensure GeoDataFrame has the specified CRS.
+
+    Sets CRS if not defined, converts if different from target.
+
+    Parameters
+    ----------
+    gdf : geopandas.GeoDataFrame
+        Input GeoDataFrame.
+    crs : int optional
+        Target CRS as EPSG code (default: 4326).
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        GeoDataFrame with the specified CRS.
+
+    Examples
+    --------
+    >>> gdf = convert_crs(gdf, 4326)
+    """
+    if gdf.crs is None:
+        return gdf.set_crs(crs)
+    elif gdf.crs.to_epsg() != crs:
+        return gdf.to_crs(crs)
+    return gdf
+
+
+def load_europe_countries(base_path):
+    """
+    Load country boundaries and filter to European region.
+
+    Parameters
+    ----------
+    base_path : pathlib.Path
+        Base path to the data directory containing 'helpers/ne_10m_admin_0_countries.shp'.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        GeoDataFrame with European countries in WGS84 CRS.
+
+    Examples
+    --------
+    >>> europe_countries = load_europe_countries(base_path)
+    >>> print(f"Loaded {len(europe_countries)} countries")
+    """
+    countries_gdf = gpd.read_file(base_path / 'helpers/ne_10m_admin_0_countries.shp')
+    
+    # Ensure CRS is WGS84
+    countries_gdf = convert_crs(countries_gdf, 4326)
+    
+    # Filter to Europe region
+    europe_bounds = {"xmin": -12, "xmax": 32, "ymin": 35, "ymax": 72}
+    europe_countries = countries_gdf.cx[
+        europe_bounds["xmin"]:europe_bounds["xmax"], 
+        europe_bounds["ymin"]:europe_bounds["ymax"]
+    ].copy()
+    
+    print(f"Loaded {len(europe_countries)} countries in Europe region")
+    return europe_countries
+
+
+def get_country_geometry(countries_gdf, country_name):
+    """
+    Extract country geometry and row from boundaries GeoDataFrame.
+
+    Parameters
+    ----------
+    countries_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with country boundaries.
+    country_name : str
+        Name of country to extract (case-insensitive).
+
+    Returns
+    -------
+    tuple
+        (country_row, country_geom) where country_row is a GeoDataFrame
+        and country_geom is the unified geometry.
+
+    Raises
+    ------
+    KeyError
+        If no name column is found in the GeoDataFrame.
+    ValueError
+        If the specified country is not found.
+
+    Examples
+    --------
+    >>> country_row, country_geom = get_country_geometry(europe_countries, 'Belgium')
+    """
+    name_col_candidates = ['ADMIN', 'NAME', 'SOVEREIGNT', 'COUNTRY', 'COUNTRY_NAME']
+    name_col = next((c for c in name_col_candidates if c in countries_gdf.columns), None)
+    if name_col is None:
+        raise KeyError(f"None of {name_col_candidates} found in country boundaries.")
+    
+    mask = countries_gdf[name_col].astype(str).str.strip().str.lower() == country_name.lower()
+    country_row = countries_gdf[mask]
+    if country_row.empty:
+        raise ValueError(f"Country '{country_name}' not found in boundaries.")
+    country_geom = country_row.geometry.unary_union
+    return country_row, country_geom
+
+
+def get_country_bounds(countries_gdf, country_name, margin_pct=0.05):
+    """
+    Get the bounding box for a country with optional margin.
+
+    Parameters
+    ----------
+    countries_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with country geometries.
+    country_name : str
+        Name of the country to get bounds for (case-insensitive).
+    margin_pct : float, optional
+        Margin as percentage of bounds (default 0.05 = 5%).
+
+    Returns
+    -------
+    tuple
+        (xlim, ylim) tuples for plot limits.
+
+    Examples
+    --------
+    >>> xlim, ylim = get_country_bounds(europe_countries, 'Belgium')
+    >>> ax.set_xlim(xlim)
+    >>> ax.set_ylim(ylim)
+    """
+    country_row = countries_gdf[countries_gdf['NAME'].str.lower() == country_name.lower()]
+    minx, miny, maxx, maxy = country_row.total_bounds
+    margin_x = (maxx - minx) * margin_pct
+    margin_y = (maxy - miny) * margin_pct
+    xlim = (minx - margin_x, maxx + margin_x)
+    ylim = (miny - margin_y, maxy + margin_y)
+    return xlim, ylim
+
+
+def get_id_column(gdf, candidates):
+    """
+    Find the first matching ID column from a list of candidates.
+
+    Parameters
+    ----------
+    gdf : pandas.DataFrame or geopandas.GeoDataFrame
+        DataFrame to search for column.
+    candidates : list of str
+        List of potential column names to look for.
+
+    Returns
+    -------
+    str
+        Name of the first matching column found.
+
+    Raises
+    ------
+    KeyError
+        If no matching column is found.
+
+    Examples
+    --------
+    >>> id_col = get_id_column(ports_gdf, ['port_code', 'id', 'node_id'])
+    """
+    col = next((c for c in candidates if c in gdf.columns), None)
+    if col is None:
+        raise KeyError(f"Could not find ID column from {candidates}")
+    return col
+
+
+def aggregate_od_flows(od_df, node_codes, value_col='value'):
+    """
+    Filter and aggregate inbound/outbound flows from OD matrix.
+
+    Parameters
+    ----------
+    od_df : pandas.DataFrame
+        DataFrame with OD data containing 'from_id', 'to_id', and value columns.
+    node_codes : list
+        List of node IDs to filter for.
+    value_col : str, optional
+        Name of the value column (default 'value').
+
+    Returns
+    -------
+    tuple
+        (inbound_df, outbound_df, inbound_agg, outbound_agg) where:
+        - inbound_df: filtered DataFrame with flows into nodes
+        - outbound_df: filtered DataFrame with flows from nodes
+        - inbound_agg: aggregated inbound flows by destination
+        - outbound_agg: aggregated outbound flows by origin
+
+    Examples
+    --------
+    >>> inbound, outbound, inbound_agg, outbound_agg = aggregate_od_flows(od_df, port_codes)
+    """
+    inbound = od_df[od_df['to_id'].isin(node_codes)].copy()
+    outbound = od_df[od_df['from_id'].isin(node_codes)].copy()
+    
+    inbound_agg = inbound.groupby('to_id')[value_col].sum().reset_index()
+    inbound_agg.columns = ['port_id', 'inbound_flow']
+    
+    outbound_agg = outbound.groupby('from_id')[value_col].sum().reset_index()
+    outbound_agg.columns = ['port_id', 'outbound_flow']
+    
+    return inbound, outbound, inbound_agg, outbound_agg
+
+
+def merge_flows_with_nodes(nodes_gdf, id_col, inbound_agg, outbound_agg, 
+                           inbound_col='inbound_flow', outbound_col='outbound_flow',
+                           name_col=None, corridor_col='CORRIDORS'):
+    """
+    Merge aggregated flows with node GeoDataFrame and aggregate by ID.
+
+    Parameters
+    ----------
+    nodes_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with node locations.
+    id_col : str
+        Name of ID column in nodes_gdf.
+    inbound_agg : pandas.DataFrame
+        DataFrame with aggregated inbound flows.
+    outbound_agg : pandas.DataFrame
+        DataFrame with aggregated outbound flows.
+    inbound_col : str, optional
+        Name for inbound flow column (default 'inbound_flow').
+    outbound_col : str, optional
+        Name for outbound flow column (default 'outbound_flow').
+    name_col : str, optional
+        Name column to preserve if exists and different from id_col.
+    corridor_col : str, optional
+        Corridor column to preserve if exists (default 'CORRIDORS').
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Aggregated nodes with flow columns and total_flow.
+
+    Examples
+    --------
+    >>> ports_flow = merge_flows_with_nodes(ports_gdf, 'port_code', 
+    ...                                      inbound_agg, outbound_agg,
+    ...                                      name_col='port_name')
+    """
+    nodes_flow = nodes_gdf.copy()
+    nodes_flow['port_id'] = nodes_flow[id_col].astype(str)
+    
+    nodes_flow = nodes_flow.merge(inbound_agg, on='port_id', how='left')
+    nodes_flow = nodes_flow.merge(outbound_agg, on='port_id', how='left')
+    
+    nodes_flow[inbound_col] = nodes_flow[inbound_col].fillna(0)
+    nodes_flow[outbound_col] = nodes_flow[outbound_col].fillna(0)
+    
+    # Build aggregation dict
+    agg_dict = {
+        inbound_col: 'sum',
+        outbound_col: 'sum',
+        'geometry': lambda x: x.unary_union.centroid
+    }
+    # Only add name_col if it exists and is different from id_col
+    if name_col and name_col in nodes_flow.columns and name_col != id_col:
+        agg_dict[name_col] = 'first'
+    
+    nodes_agg = nodes_flow.groupby(id_col).agg(agg_dict).reset_index()
+    nodes_agg = gpd.GeoDataFrame(nodes_agg, geometry='geometry', crs=nodes_flow.crs)
+    nodes_agg['total_flow'] = nodes_agg[inbound_col] + nodes_agg[outbound_col]
+    
+    # Merge corridor info if exists
+    if corridor_col in nodes_gdf.columns:
+        corridor_map = nodes_gdf[[id_col, corridor_col]].drop_duplicates(subset=[id_col])
+        nodes_agg = nodes_agg.merge(corridor_map, on=id_col, how='left')
+    
+    return nodes_agg
+
+
+def print_transport_summary(country_name, num_nodes, freight_df, passenger_df,
+                           freight_inbound_col, freight_outbound_col,
+                           passenger_inbound_col, passenger_outbound_col,
+                           freight_unit='tons/day', passenger_unit='passengers/day',
+                           node_type='Ports'):
+    """
+    Print summary statistics for transport flows.
+
+    Parameters
+    ----------
+    country_name : str
+        Name of the country.
+    num_nodes : int
+        Number of infrastructure nodes.
+    freight_df : pandas.DataFrame
+        DataFrame with freight flow data.
+    passenger_df : pandas.DataFrame
+        DataFrame with passenger flow data.
+    freight_inbound_col : str
+        Column name for inbound freight flows.
+    freight_outbound_col : str
+        Column name for outbound freight flows.
+    passenger_inbound_col : str
+        Column name for inbound passenger flows.
+    passenger_outbound_col : str
+        Column name for outbound passenger flows.
+    freight_unit : str, optional
+        Unit string for freight display (default 'tons/day').
+    passenger_unit : str, optional
+        Unit string for passenger display (default 'passengers/day').
+    node_type : str, optional
+        Type of nodes for display (default 'Ports').
+
+    Examples
+    --------
+    >>> print_transport_summary('Belgium', len(ports), freight_df, passenger_df,
+    ...                         'inbound_flow', 'outbound_flow',
+    ...                         'inbound_passengers', 'outbound_passengers')
+    """
+    print("=" * 60)
+    print(f"SUMMARY FOR {country_name}")
+    print("=" * 60)
+    print(f"\nInfrastructure:")
+    print(f"  {node_type}: {num_nodes}")
+    
+    print(f"\nFreight Flows:")
+    print(f"  {node_type} with inbound flow: {(freight_df[freight_inbound_col] > 0).sum()}")
+    print(f"  {node_type} with outbound flow: {(freight_df[freight_outbound_col] > 0).sum()}")
+    print(f"  Total inbound: {freight_df[freight_inbound_col].sum():,.0f} {freight_unit}")
+    print(f"  Total outbound: {freight_df[freight_outbound_col].sum():,.0f} {freight_unit}")
+    print(f"  Net flow: {(freight_df[freight_outbound_col].sum() - freight_df[freight_inbound_col].sum()):,.0f} {freight_unit}")
+    
+    print(f"\nPassenger Flows:")
+    print(f"  {node_type} with inbound flow: {(passenger_df[passenger_inbound_col] > 0).sum()}")
+    print(f"  {node_type} with outbound flow: {(passenger_df[passenger_outbound_col] > 0).sum()}")
+    print(f"  Total inbound: {passenger_df[passenger_inbound_col].sum():,.0f} {passenger_unit}")
+    print(f"  Total outbound: {passenger_df[passenger_outbound_col].sum():,.0f} {passenger_unit}")
+    print(f"  Net flow: {(passenger_df[passenger_outbound_col].sum() - passenger_df[passenger_inbound_col].sum()):,.0f} {passenger_unit}")
+    print("=" * 60)
+
+
+def prepare_od_data(od_df, origin_col, dest_col, value_col):
+    """
+    Prepare OD data by standardizing node columns and filtering positive values.
+
+    Parameters
+    ----------
+    od_df : pandas.DataFrame
+        DataFrame with OD data.
+    origin_col : str
+        Name of origin column (e.g., 'origin_node' or 'from_id').
+    dest_col : str
+        Name of destination column (e.g., 'dest_node' or 'to_id').
+    value_col : str
+        Name of value column to filter on.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Cleaned DataFrame with standardized 'from_node', 'to_node' columns
+        and positive values only.
+
+    Examples
+    --------
+    >>> od_cars = prepare_od_data(od_flows_cars, 'origin_node', 'dest_node', 'cars_vehicles')
+    """
+    df = od_df.copy()
+    df['from_node'] = df[origin_col].astype(str)
+    df['to_node'] = df[dest_col].astype(str)
+    df = df.dropna(subset=['from_node', 'to_node'])
+    df[value_col] = pd.to_numeric(df[value_col], errors='coerce').fillna(0.0)
+    df = df.drop(columns=[origin_col, dest_col], errors='ignore')
+    df = df[df[value_col] > 0]
+    return df
+
+
+def plot_flow_map(ax, network_df, flow_col, corridors_col, countries_gdf, xlim, ylim, 
+                  title, legend_ticks, lw_min=0.5, lw_max=5, scale='linear', scale_div=100):
+    """
+    Plot flow map with standard styling.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Matplotlib axis to plot on.
+    network_df : geopandas.GeoDataFrame
+        GeoDataFrame with flow data and geometry.
+    flow_col : str
+        Column name for flow values.
+    corridors_col : str
+        Column name for corridor categories.
+    countries_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with country boundaries for overlay.
+    xlim : tuple
+        (min, max) x-axis limits.
+    ylim : tuple
+        (min, max) y-axis limits.
+    title : str
+        Plot title.
+    legend_ticks : list
+        List of tick values for the legend.
+    lw_min : float, optional
+        Minimum line width (default 0.5).
+    lw_max : float, optional
+        Maximum line width (default 5).
+    scale : str, optional
+        Scale type 'linear' or 'log' (default 'linear').
+    scale_div : float, optional
+        Scale divisor for flow values (default 100).
+
+    Examples
+    --------
+    >>> plot_flow_map(ax, network_df, 'assigned_flow', 'CORRIDORS',
+    ...               europe_countries, xlim, ylim, 'Flow Map',
+    ...               legend_ticks=[1000, 10000, 100000])
+    """
+    plot_edges_by_flow_thickness(
+        ax, network_df, flow_col=flow_col, corridors_col=corridors_col,
+        lw_min=lw_min, lw_max=lw_max, scale=scale, scale_div=scale_div, legend_ticks=legend_ticks
+    )
+    countries_gdf.boundary.plot(ax=ax, color='black', linewidth=0.5)
+    ax.set_title(title)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+
+def print_flow_statistics(network_df, columns, labels):
+    """
+    Print summary statistics for flow columns.
+
+    Parameters
+    ----------
+    network_df : pandas.DataFrame
+        DataFrame with flow data.
+    columns : list of str
+        List of column names to summarize.
+    labels : list of str
+        List of labels for each column.
+
+    Examples
+    --------
+    >>> print_flow_statistics(network_df,
+    ...     columns=['assigned_vehicles', 'cars_on_edge'],
+    ...     labels=['PCU (all)', 'Cars'])
+    """
+    print("=" * 80)
+    print("PER-EDGE FLOW STATISTICS")
+    print("=" * 80)
+    for col, label in zip(columns, labels):
+        if col in network_df.columns:
+            vals = network_df[col].fillna(0)
+            print(f"{label}:")
+            print(f"  Total: {vals.sum():,.0f}")
+            print(f"  Max:   {vals.max():,.0f}")
+            print(f"  Mean:  {vals.mean():,.2f}")
+            print(f"  Nonzero edges: {(vals > 0).sum()} / {len(vals)}")
+            print()
+
+
+def print_network_flow_summary(g, nodes_gdf, od_flows, paths_df, edge_flow, n_edges,
+                               flow_col='value', flow_unit='ths tons/year',
+                               network_type='IWW'):
+    """
+    Print summary statistics for network flow assignment.
+
+    Parameters
+    ----------
+    g : igraph.Graph
+        Network graph object.
+    nodes_gdf : geopandas.GeoDataFrame
+        GeoDataFrame with network nodes.
+    od_flows : pandas.DataFrame
+        DataFrame with OD flows.
+    paths_df : pandas.DataFrame
+        DataFrame with calculated paths.
+    edge_flow : numpy.ndarray
+        Array with flow values per edge.
+    n_edges : int
+        Total number of edges in the network.
+    flow_col : str, optional
+        Column name containing flow values (default 'value').
+    flow_unit : str, optional
+        Unit string for display (default 'ths tons/year').
+    network_type : str, optional
+        Type of network for display (default 'IWW').
+
+    Examples
+    --------
+    >>> print_network_flow_summary(g, ports_gdf, od_flows, paths_df, edge_flow,
+    ...                            len(edges_gdf), network_type='Rail')
+    """
+    print("=" * 80)
+    print(f"{network_type.upper()} FLOW ASSIGNMENT SUMMARY")
+    print("=" * 80)
+    
+    print(f"\nNetwork:")
+    print(f"  Nodes: {g.vcount():,}")
+    print(f"  Edges: {g.ecount():,}")
+    print(f"  Infrastructure nodes: {len(nodes_gdf):,}")
+    
+    print(f"\nOD Matrix:")
+    print(f"  Total OD pairs: {len(od_flows):,}")
+    print(f"  Routable pairs: {len(paths_df):,}")
+    print(f"  Total flow: {od_flows[flow_col].sum():,.0f} {flow_unit}")
+    
+    print(f"\nFlow Assignment:")
+    print(f"  Edges with flow: {(edge_flow > 0).sum():,} / {n_edges:,} ({100*(edge_flow > 0).sum()/n_edges:.1f}%)")
+    print(f"  Total flow on network: {edge_flow.sum():,.0f} {flow_unit}")
+    print(f"  Max edge flow: {edge_flow.max():,.0f} {flow_unit}")
+    if (edge_flow > 0).sum() > 0:
+        print(f"  Mean edge flow (non-zero): {edge_flow[edge_flow > 0].mean():,.0f} {flow_unit}")
+    
+    print("\n" + "=" * 80)
+    print("COMPLETE")
+    print("=" * 80)
+
+
+def print_capacity_flow_summary(od_df, assigned_df_or_list, flow_col, label, unit=''):
+    """
+    Print summary statistics for capacity-constrained flow assignment.
+
+    Parameters
+    ----------
+    od_df : pandas.DataFrame
+        Original OD DataFrame with flow demands.
+    assigned_df_or_list : pandas.DataFrame or list
+        Assigned flows DataFrame or list of DataFrames from capacity allocation.
+    flow_col : str
+        Column name containing flow values.
+    label : str
+        Label for the flow type (e.g., 'PASSENGER', 'FREIGHT').
+    unit : str, optional
+        Unit string to append to values (e.g., 'ths tons').
+
+    Examples
+    --------
+    >>> print_capacity_flow_summary(od_pass, capacity_ods_pass, 'trips', 'PASSENGER')
+    >>> print_capacity_flow_summary(od_freight, capacity_ods_freight, 'ths_tons', 
+    ...                             'FREIGHT', 'ths tons')
+    """
+    # Get assigned DataFrame
+    if isinstance(assigned_df_or_list, list):
+        assigned_df = pd.concat(assigned_df_or_list, ignore_index=True) if assigned_df_or_list else pd.DataFrame()
+    else:
+        assigned_df = assigned_df_or_list if assigned_df_or_list is not None else pd.DataFrame()
+    
+    total_ods = len(od_df)
+    total_flow = od_df[flow_col].sum()
+    
+    if not assigned_df.empty and flow_col in assigned_df.columns:
+        max_edge_flow = assigned_df[flow_col].max()
+        mean_edge_flow = assigned_df[flow_col].mean()
+    else:
+        max_edge_flow = 0.0
+        mean_edge_flow = 0.0
+    
+    unit_str = f' {unit}' if unit else ''
+    
+    print("=" * 80)
+    print(f"{label} FLOW SUMMARY")
+    print("=" * 80)
+    print(f"Total OD pairs: {total_ods:,}")
+    print(f"Total {flow_col}: {total_flow:,.0f}{unit_str}")
+    print(f"Max edge flow ({label.lower()}): {max_edge_flow:,.0f}{unit_str}")
+    print(f"Mean edge flow ({label.lower()}): {mean_edge_flow:,.0f}{unit_str}")
+    print()
